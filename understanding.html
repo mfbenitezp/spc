@@ -3,7 +3,7 @@
   <meta charset="utf-8">
   <meta name="generator" content="quarto-0.9.4">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-  <title>Synthetic Population Catalyst</title>
+  <title>Synthetic Population Catalyst - The Data Schema</title>
   <style>
     code{white-space: pre-wrap;}
     span.smallcaps{font-variant: small-caps;}
@@ -53,12 +53,12 @@
   <![endif]-->
   <link rel="stylesheet" href="styles.css">
 </head>
-<body class="docked fullcontent">
+<body class="docked">
 <div id="quarto-search-results"></div>
   <header id="quarto-header" class="headroom fixed-top">
   <nav class="quarto-secondary-nav" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
     <div class="container-fluid d-flex justify-content-between">
-      <h1 class="quarto-secondary-nav-title">Synthetic Population Catalyst</h1>
+      <h1 class="quarto-secondary-nav-title">The Data Schema</h1>
       <button type="button" class="quarto-btn-toggle btn">
         <i class="bi bi-chevron-right"></i>
       </button>
@@ -83,7 +83,7 @@
     <ul class="list-unstyled mt-1">
         <li class="sidebar-item">
   <div class="sidebar-item-container"> 
-  <a href="./index.html" class="sidebar-item-text sidebar-link active">Synthetic Population Catalyst</a>
+  <a href="./index.html" class="sidebar-item-text sidebar-link">Synthetic Population Catalyst</a>
   </div>
 </li>
         <li class="sidebar-item sidebar-item-section">
@@ -121,7 +121,7 @@
     <ul id="quarto-sidebar-section-understanding-it" class="collapse list-unstyled sidebar-section depth1 show">  
         <li class="sidebar-item">
   <div class="sidebar-item-container"> 
-  <a href="./understanding.html" class="sidebar-item-text sidebar-link">The Data Schema</a>
+  <a href="./understanding.html" class="sidebar-item-text sidebar-link active">The Data Schema</a>
   </div>
 </li>
         <li class="sidebar-item">
@@ -165,22 +165,39 @@
     </div>
 </nav>
 <!-- margin-sidebar -->
-    
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc">
+<h2 id="toc-title">On this page</h2>
+<ul>
+<li><a href="#understanding-the-schema" class="nav-link active" data-scroll-target="#understanding-the-schema">Understanding the schema</a></li>
+<li><a href="#modelling-the-daily-activites---flows" class="nav-link" data-scroll-target="#modelling-the-daily-activites---flows">Modelling the daily activites - Flows</a></li>
+</ul>
+</nav>
+    </div>
 <!-- main -->
 <main class="content" id="quarto-document-content">
 <header id="title-block-header">
-<h1 class="title d-none d-lg-block display-7">Synthetic Population Catalyst</h1>
+<h1 class="title d-none d-lg-block display-7">The Data Schema</h1>
 </header>
-<div class="quarto-figure quarto-figure-center">
-<figure class="figure">
-<p><img src="img/UK_LAD.png" class="img-fluid figure-img"></p>
-<p></p><figcaption aria-hidden="true" class="figure-caption">SPC Schema</figcaption><p></p>
-</figure>
-</div>
-<p>The Synthetic Population Catalyst (SPC) makes it easier for researchers to work with synthetic population data in England. It combines a variety of <a href="./data_sources.html">data sources</a> and outputs a single file in <a href="https://github.com/alan-turing-institute/uatk-spc/blob/main/synthpop.proto">protocol buffer format</a>, describing the population in a given study area. The tool also provides methods to export the outcome in diferent formats often use for researchers like CSV or JSON.</p>
-<p>The input of the SPC tool is a list of the Middle Layer Super Output Area (MSOAs) where you want to create a spatially enriched sythetic population to feed other dynamic models. SPC includes a script to assist you with the proper list of the MSOAs by defining a Local Authority District area in England. <a href="./getting_started.html">Get started</a> to download SPC data or run the tool in different MSOAs.</p>
+
+<section id="understanding-the-schema" class="level2">
+<h2 class="anchored" data-anchor-id="understanding-the-schema">Understanding the schema</h2>
+<p>Here are some helpful tips for understanding the <a href="https://github.com/alan-turing-institute/uatk-spc/blob/main/synthpop.proto">schema</a>.</p>
+<p>Each .pb file contains exactly one <code>Population</code> message. In contrast to datasets consisting of multiple <code>.csv</code> files, just a single file contains everything. Some of the fields in <code>Population</code> are lists (of people and households) or maps (of venues keyed by activity, or of MSOAs). Unlike a flat <code>.csv</code> table, there may be more lists embedded later. Each <code>Household</code> has a list of <code>members</code>, for example.</p>
+<p>The different objects refer to each other, forming a graph structure. The protobuf uses <code>uint64</code> IDs to index into other lists. For example, if some household has <code>members = [3, 10]</code>, then those two people can be found at <code>population.people[3]</code> and <code>population.people[10]</code>. Each of them will have the same <code>household</code> ID, pointing back to something in the <code>population.households</code> list.</p>
+</section>
+<section id="modelling-the-daily-activites---flows" class="level2">
+<h2 class="anchored" data-anchor-id="modelling-the-daily-activites---flows">Modelling the daily activites - Flows</h2>
+<p>SPC models daily travel behavior of people as “flows.” Flows are broken down by by an <a href="https://github.com/alan-turing-institute/uatk-spc/blob/feffb857c6fbbd7c2b3dd1f3cb46e67677185897/synthpop.proto#L196">activity</a> – shopping/retail, attending primary or secondary school, working, or staying at home. For each activity type, a person has a list of venues where they may do that activity, weighted by a probability of going to that particular venue.</p>
+<p>Note that <code>flows_per_activity</code> is stored in <code>InfoPerMSOA</code>, not <code>Person</code>. The flows for retail and school are only known at the MSOA level, not individually. So given a particular <code>Person</code> object, you first look up their household’s MSOA – <code>msoa = population.households[ person.household ].msoa</code> and then look up flows for that MSOA – <code>population.info_per_msoa[msoa].flows_per_activity</code>.</p>
+<p>Each person has exactly 1 flow for home – it’s just <code>person.household</code> with probability 1. A person has 0 or 1 flows to work, based on the value of <code>person.workplace</code>.</p>
+<p>This doesn’t mean that all people in the same MSOA share the same travel behavior. Each person has their own <code>activity_durations</code> field, based on time-use survey data. Even if two people share the same set of places where they may go shopping, one person may spend much more time on that activity than another.</p>
+<p>See the <a href="https://github.com/alan-turing-institute/uatk-aspics/blob/c8ad47cb01b084028b2f8ca90fcf078470efbee0/convert_snapshot.py#L166">ASPICS conversion script</a> for all of this in action – it has a function to collapse a person’s flows down into a single weighted list.</p>
+<p>How do you interpret the probabilities/weights for flows? If your model needs people to visit specific places each day, you could randomly sample a venue from the flows, weighting them appropriately. For retail, you may want to repeat this sampling every day of the simulation, so they visit different venues. For primary and secondary school, it may be more appropriate to sample once and store that for the simulation – a student probably doesn’t switch schools daily.</p>
+<p>Alternatively, you can follow what ASPICS does. Every day, each person logically visits all possible venues, but their interaction there (possibly receiving or transmitting COVID) is weighted by the probability of each venue.</p>
 
 
+</section>
 </main> <!-- /main -->
 <script type="application/javascript">
 window.document.addEventListener("DOMContentLoaded", function (event) {
