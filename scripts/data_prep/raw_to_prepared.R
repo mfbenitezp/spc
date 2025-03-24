@@ -975,6 +975,11 @@ rownames(oatoOtherS) <- 1:nrow(oatoOtherS)
 oatoOther <- rbind(oatoOtherEW,oatoOtherS)
 rownames(oatoOther) <- 1:nrow(oatoOther)
 
+# Replace 'great-britain' with 'united-kingdom' in OSM URLs
+# See: https://github.com/alan-turing-institute/uatk-spc/issues/73
+oatoOther <- oatoOther %>%
+  mutate(OSM = gsub("/great-britain/", "/united-kingdom/", OSM))
+
 # Output
 print("Writing outputs...")
 write.table(oatoOther,paste(folderOut,"lookUp-GB.csv",sep = ""),row.names = F, sep = ",")
