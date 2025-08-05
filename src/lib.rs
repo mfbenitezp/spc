@@ -9,6 +9,7 @@ mod init;
 pub mod protobuf;
 pub mod tracing_span_tree;
 pub mod utilities;
+pub mod writers;
 
 use derive_more::{From, Into};
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,25 +47,34 @@ pub struct Population {
     pub info_per_msoa: BTreeMap<MSOA, InfoPerMSOA>,
 
     pub lockdown: pb::Lockdown,
+    pub time_use_diaries: TiVec<DiaryID, pb::TimeUseDiary>,
+
+    pub year: u32,
 }
 
+#[derive(Clone)]
 pub struct Input {
+    pub year: u32,
     pub enable_commuting: bool,
+    pub filter_empty_msoas: bool,
     /// Only people living in MSOAs filled out here will be part of the population
     pub msoas: BTreeSet<MSOA>,
-    /// The minimum proportion of the population that must be preserved when using the sic1d07
+    /// The minimum proportion of the population that must be preserved when using the sic1d2007
     /// classification
     pub sic_threshold: f64,
 }
 
-/// Represents a region of the UK.
+/// A region of the UK with around 7800 people.
 ///
 /// See https://en.wikipedia.org/wiki/ONS_coding_system. This is usually called `MSOA11CD`.
-// TODO Given one of these, how do we look it up?
-// - http://statistics.data.gov.uk/id/statistical-geography/E02002191
-// - https://mapit.mysociety.org/area/36070.html (they have a paid API)
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub struct MSOA(pub String);
+
+/// A region of the UK with around X people.
+///
+/// See https://en.wikipedia.org/wiki/ONS_coding_system. This is usually called `OA11CD`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+pub struct OA(pub String);
 
 /// This represents a 2020 county boundary, which contains several MSOAs. It's used in Google
 /// mobility data. It's not the same county as defined by ONS.
@@ -79,7 +89,7 @@ impl MSOA {
 
 pub struct InfoPerMSOA {
     pub shape: MultiPolygon<f32>,
-    pub population: usize,
+    pub population: u64,
     /// All building centroids within this MSOA.
     ///
     /// Note there are many caveats about building data in OpenStreetMap -- what counts as
@@ -96,33 +106,27 @@ pub struct InfoPerMSOA {
 pub struct Household {
     pub id: VenueID,
     pub msoa: MSOA,
-    /// An ID from the original data, kept around for debugging
-    pub orig_hid: isize,
+    pub oa: OA,
     pub members: Vec<PersonID>,
+    pub details: pb::HouseholdDetails,
 }
 
 pub struct Person {
     pub id: PersonID,
     pub household: VenueID,
     pub workplace: Option<VenueID>,
-    /// This is the centroid of the household's MSOA. It's redundant to store it per person, but
-    /// very convenient.
+    /// This is the centroid of the household's OA. It's redundant to store it per person, but very
+    /// convenient.
     pub location: Point<f32>,
-    // IDs from the original data
-    pub orig_pid_census: i64,
-    pub orig_pid_tus: i64,
-    pub orig_pid_hse: i64,
 
+    pub identifiers: pb::Identifiers,
     pub demographics: pb::Demographics,
-    pub bmi: BMI,
-    pub has_cardiovascular_disease: bool,
-    pub has_diabetes: bool,
-    pub has_high_blood_pressure: bool,
+    pub employment: pb::Employment,
+    pub health: pb::Health,
 
-    pub time_use: pb::TimeUse,
-
-    /// These sum to 1, representing a fraction of a day
-    pub duration_per_activity: EnumMap<Activity, f64>,
+    pub events: pb::Events,
+    pub weekday_diaries: Vec<DiaryID>,
+    pub weekend_diaries: Vec<DiaryID>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Enum)]
@@ -134,18 +138,6 @@ pub enum Activity {
     Work,
 }
 
-impl Activity {
-    pub fn all() -> Vec<Activity> {
-        vec![
-            Activity::Retail,
-            Activity::PrimarySchool,
-            Activity::SecondarySchool,
-            Activity::Home,
-            Activity::Work,
-        ]
-    }
-}
-
 /// Represents a place where people do an activity
 pub struct Venue {
     pub id: VenueID,
@@ -154,17 +146,7 @@ pub struct Venue {
     pub location: Point<f32>,
     /// This only exists for PrimarySchool and SecondarySchool. It's a
     /// https://en.wikipedia.org/wiki/Unique_Reference_Number
-    pub urn: Option<usize>,
-}
-
-pub enum BMI {
-    NotApplicable,
-    Underweight,
-    Normal,
-    Overweight,
-    Obese1,
-    Obese2,
-    Obese3,
+    pub urn: Option<String>,
 }
 
 // These are unsigned integers, used to index into different vectors. They're wrapped in a type, so
@@ -186,5 +168,13 @@ pub struct VenueID(pub usize);
 impl fmt::Display for VenueID {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Venue #{}", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, From, Into)]
+pub struct DiaryID(pub usize);
+impl fmt::Display for DiaryID {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Diary #{}", self.0)
     }
 }

@@ -1,4 +1,5 @@
 mod commuting;
+mod diaries;
 mod lockdown;
 mod msoas;
 mod population;
@@ -34,14 +35,17 @@ impl Population {
             venues_per_activity: EnumMap::default(),
             info_per_msoa: BTreeMap::new(),
             lockdown: crate::pb::Lockdown::default(),
+            time_use_diaries: TiVec::new(),
+            year: input.year,
         };
 
         population.info_per_msoa =
             msoas::get_info_per_msoa(&population.msoas, raw_results.osm_directories)?;
 
-        population::read_individual_time_use_and_health_data(
+        population::read_people(
             &mut population,
-            raw_results.tus_files,
+            raw_results.population_files,
+            raw_results.oa_to_msoa,
         )?;
 
         // The order doesn't matter for these steps
@@ -64,11 +68,27 @@ impl Population {
             &mut population,
         )?;
 
-        // TODO The Python implementation has lots of commented stuff, then some rounding
-
-        population.lockdown =
-            lockdown::calculate_lockdown_per_day(raw_results.msoas_per_county, &population)?;
+        population.lockdown = lockdown::calculate_lockdown_per_day(raw_results.msoas_per_county)?;
         population.remove_unused_venues();
+
+        diaries::load_time_use_diaries(&mut population)?;
+        diaries::load_diaries_per_person(&mut population)?;
+
+        if input.filter_empty_msoas {
+            let mut msoas_seen = BTreeSet::new();
+            for hh in &population.households {
+                msoas_seen.insert(hh.msoa.clone());
+            }
+            let n = population.info_per_msoa.len();
+            population
+                .info_per_msoa
+                .retain(|msoa, _| msoas_seen.contains(msoa));
+            let change = n - population.info_per_msoa.len();
+            if change != 0 {
+                warn!("Filtered out {change} empty MSOAs");
+            }
+        }
+
         Ok((population, commuting_duration))
     }
 

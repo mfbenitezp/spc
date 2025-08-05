@@ -87,6 +87,30 @@ pub fn unzip(file: PathBuf, output_dir: &str) -> Result<()> {
     }
 }
 
+/// Gunzip a file in-place. Returns the path without the .gz extension
+pub fn gunzip(file: PathBuf) -> Result<String> {
+    let target = file
+        .display()
+        .to_string()
+        .trim_end_matches(".gz")
+        .to_string();
+    if Path::new(&target).exists() {
+        info!("{target} already exists, not gunzipping");
+        return Ok(target);
+    }
+
+    info!("Gunzipping {}...", file.display());
+    let status = Command::new("gunzip").arg(file).status()?;
+    if status.success() {
+        Ok(target)
+    } else {
+        bail!("Command failed");
+    }
+
+    // TODO Ideally delete the .gz file, and make the download+gunzip step smart about seeing the
+    // final target
+}
+
 /// Extract the filename from a path -- for example, "foo.txt.gz" from "/home/someone/foo.txt.gz"
 pub fn filename<P: AsRef<Path>>(path: P) -> String {
     path.as_ref()
@@ -119,19 +143,21 @@ pub fn print_count(x: usize) -> String {
 // https://github.com/mihaigalos/tutorials/blob/master/rust/download_with_progressbar/src/main.rs
 async fn download_file(url: &str, path: &str) -> Result<()> {
     let client = Client::new();
-    let res = client.get(url).send().await?;
-    let total_size = res
+    let response = client.get(url).send().await?;
+    let response = response.error_for_status()?;
+    let total_size = response
         .content_length()
         .ok_or_else(|| anyhow!("Failed to get content length from {}", url))?;
 
     let pb = ProgressBar::new(total_size);
     pb.set_style(ProgressStyle::default_bar()
         .template("[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+        .unwrap()
         .progress_chars("#-"));
 
     let mut file = File::create(path)?;
     let mut downloaded: u64 = 0;
-    let mut stream = res.bytes_stream();
+    let mut stream = response.bytes_stream();
 
     while let Some(item) = stream.next().await {
         let chunk = item?;
@@ -173,6 +199,7 @@ pub fn progress_count(len: usize) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] [{wide_bar:.cyan/blue}] {human_pos}/{human_len} ({eta})")
+            .unwrap()
             .progress_chars("#-"),
     );
     pb
@@ -185,6 +212,7 @@ pub fn progress_count_with_msg(len: usize) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg}\n[{elapsed_precise}] [{wide_bar:.cyan/blue}] {human_pos}/{human_len} ({eta})")
+            .unwrap()
             .progress_chars("#-"),
     );
     pb
@@ -198,6 +226,7 @@ pub fn progress_file_with_msg(file: &File) -> Result<ProgressBar> {
             .template(
                 "{msg}\n[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})",
             )
+            .unwrap()
             .progress_chars("#-"),
     );
     Ok(pb)

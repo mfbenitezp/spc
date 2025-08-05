@@ -10,7 +10,6 @@ use geo::Point;
 use ndarray::Array2;
 use ndarray_npy::ReadNpyExt;
 use ordered_float::NotNan;
-use proj::Proj;
 use serde::Deserialize;
 use typed_index_collections::TiVec;
 
@@ -42,7 +41,7 @@ pub fn get_flows(
         Activity::Home | Activity::Work => unreachable!(),
     };
     for rec in csv::Reader::from_reader(File::open(
-        Path::new("data/raw_data/nationaldata/QUANT_RAMP").join(population_csv),
+        Path::new("data/raw_data/nationaldata-v2/QUANT_RAMP").join(population_csv),
     )?)
     .deserialize()
     {
@@ -50,13 +49,13 @@ pub fn get_flows(
         msoa_to_zonei.insert(rec.msoaiz, rec.zonei);
     }
 
-    let table_path = format!("data/raw_data/nationaldata/QUANT_RAMP/{}", prob_sij);
+    let table_path = format!("data/raw_data/nationaldata-v2/QUANT_RAMP/{}", prob_sij);
     let table = Array2::<f64>::read_npy(File::open(table_path)?)?;
 
     let pb = progress_count_with_msg(msoas.len());
     let mut result = BTreeMap::new();
     for msoa in msoas {
-        // TODO The Python code defaults to 0 when the MSOA is missing; this seems problematic?
+        // TODO [fix]: to skip if MSOA not in lookup as `unwrap_or(0)` will be incorrect
         let zonei = msoa_to_zonei.get(msoa).cloned().unwrap_or(0);
         pb.set_message(format!(
             "Get {:?} flows for {} (zonei {})",
@@ -126,9 +125,6 @@ fn get_venue_flows(
 }
 
 pub fn load_venues(activity: Activity) -> Result<TiVec<VenueID, Venue>> {
-    // I had the wrong CRS originally, but it's from "British National Grid"
-    let reproject = Proj::new_known_crs("EPSG:27700", "EPSG:4326", None)?;
-
     let csv_path = match activity {
         Activity::Retail => "retailpointsZones.csv",
         Activity::PrimarySchool => "primaryZones.csv",
@@ -137,7 +133,7 @@ pub fn load_venues(activity: Activity) -> Result<TiVec<VenueID, Venue>> {
     };
     let mut venues = TiVec::new();
     for rec in csv::Reader::from_reader(File::open(format!(
-        "data/raw_data/nationaldata/QUANT_RAMP/{}",
+        "data/raw_data/nationaldata-v2/QUANT_RAMP/{}",
         csv_path
     ))?)
     .deserialize()
@@ -146,12 +142,10 @@ pub fn load_venues(activity: Activity) -> Result<TiVec<VenueID, Venue>> {
         // Let's check this while we're at it
         assert_eq!(venues.len(), rec.zonei);
 
-        let (x, y) = reproject.convert((rec.east, rec.north))?;
-
         venues.push(Venue {
             id: VenueID(venues.len()),
             activity,
-            location: Point::new(x, y),
+            location: Point::new(rec.lon, rec.lat),
             urn: rec.urn,
         });
     }
@@ -166,10 +160,11 @@ struct PopulationRow {
 
 #[derive(Debug, Deserialize)]
 struct ZoneRow {
-    east: f32,
-    north: f32,
+    lon: f32,
+    lat: f32,
     zonei: usize,
-    urn: Option<usize>,
+    #[serde(rename = "URN")]
+    urn: Option<String>,
 }
 
 // Make things sum to 1

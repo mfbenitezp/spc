@@ -1,31 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
-use enum_map::EnumMap;
 use fs_err::File;
 use geo::Point;
 use serde::{Deserialize, Deserializer};
 
 use super::quant::{get_flows, load_venues, Threshold};
 use crate::utilities::{memory_usage, print_count, progress_count, progress_file_with_msg};
-use crate::{pb, Activity, Household, Person, PersonID, Population, VenueID, BMI, MSOA};
+use crate::{pb, Activity, Household, Person, PersonID, Population, VenueID, MSOA, OA};
 
-pub fn read_individual_time_use_and_health_data(
+pub fn read_people(
     population: &mut Population,
-    tus_files: Vec<String>,
+    population_files: Vec<String>,
+    oa_to_msoa: BTreeMap<OA, MSOA>,
 ) -> Result<()> {
-    let _s = info_span!("read_individual_time_use_and_health_data").entered();
+    let _s = info_span!("read_people").entered();
 
-    // First read the raw CSV files and just group the raw rows by household (MSOA and hid)
-    // This isn't all that memory-intensive; the Population ultimately has to hold everyone anyway.
+    // First read the raw CSV files and just group the raw rows by household ID. This isn't all
+    // that memory-intensive; the Population ultimately has to hold everyone anyway.
     //
     // If there are multiple time use files, we assume this grouping won't have any overlaps --
-    // MSOAs shouldn't be the same between different files.
-    let mut people_per_household: BTreeMap<(MSOA, isize), Vec<TuPerson>> = BTreeMap::new();
-    let mut no_household = 0;
+    // household IDs should be globally unique.
+    let mut people_per_household: BTreeMap<String, Vec<RawPerson>> = BTreeMap::new();
+    let mut household_details: BTreeMap<String, pb::HouseholdDetails> = BTreeMap::new();
 
     // TODO Two-level progress bar. MultiProgress seems to demand two threads and calling join() :(
-    for path in tus_files {
+    for path in population_files {
         let _s = info_span!("Reading", ?path).entered();
         let file = File::open(path)?;
         let pb = progress_file_with_msg(&file)?;
@@ -38,45 +38,64 @@ pub fn read_individual_time_use_and_health_data(
                 ));
             }
 
-            let rec: TuPerson = rec?;
+            let rec: RawPerson = rec?;
+            let msoa = if let Some(msoa) = oa_to_msoa.get(&rec.oa) {
+                msoa.clone()
+            } else {
+                bail!("Unknown {:?}", rec.oa);
+            };
 
-            // Skip people that weren't matched to a household
-            if rec.hid == -1 {
-                no_household += 1;
+            // Only keep people in the input set of MSOAs
+            if !population.msoas.contains(&msoa) {
                 continue;
             }
 
-            // Only keep people in the input set of MSOAs
-            if !population.msoas.contains(&rec.msoa) {
-                continue;
+            // Assume the household details are equivalent for every row in the input
+            if !household_details.contains_key(&rec.hid) {
+                household_details.insert(
+                    rec.hid.clone(),
+                    pb::HouseholdDetails {
+                        hid: rec.hid.clone(),
+                        // TODO If the numeric values don't match, just gives up. Should we check
+                        // for -1 explicitly?
+                        nssec8: pb::Nssec8::from_i32(rec.hh_nssec8).map(|x| x.into()),
+                        accommodation_type: pb::AccommodationType::from_i32(rec.accommodation_type)
+                            .map(|x| x.into()),
+                        communal_type: pb::CommunalType::from_i32(rec.communal_type)
+                            .map(|x| x.into()),
+                        num_rooms: parse_optional_neg1(rec.num_rooms)?,
+                        central_heat: match rec.central_heat {
+                            0 => false,
+                            1 => true,
+                            x => bail!("Unexpected central_heat {x}"),
+                        },
+                        tenure: pb::Tenure::from_i32(rec.tenure).map(|x| x.into()),
+                        num_cars: parse_optional_neg1(rec.num_cars)?,
+                    },
+                );
             }
 
             people_per_household
-                .entry((rec.msoa.clone(), rec.hid))
+                .entry(rec.hid.clone())
                 .or_insert_with(Vec::new)
                 .push(rec);
         }
-    }
-
-    if no_household > 0 {
-        warn!(
-            "{} people skipped, no household originally",
-            print_count(no_household)
-        );
     }
 
     // Now create the people and households
     let _s = info_span!("Creating households").entered();
     info!("Creating households ({})", memory_usage());
     let pb = progress_count(people_per_household.len());
-    for ((msoa, orig_hid), raw_people) in people_per_household {
+    for (hid, raw_people) in people_per_household {
         pb.inc(1);
         let household_id = VenueID(population.households.len());
         let mut household = Household {
             id: household_id,
-            msoa,
-            orig_hid,
+            // TODO Assume everyone in the same household belongs to the same MSOA and OA. Check this?
+            msoa: oa_to_msoa[&raw_people[0].oa].clone(),
+            oa: raw_people[0].oa.clone(),
             members: Vec::new(),
+            details: household_details.remove(&hid).unwrap(),
         };
         for raw_person in raw_people {
             let person_id = PersonID(population.people.len());
@@ -115,186 +134,168 @@ pub fn read_individual_time_use_and_health_data(
 }
 
 #[derive(Deserialize)]
-struct TuPerson {
-    #[serde(rename = "MSOA11CD")]
-    msoa: MSOA,
-    #[serde(deserialize_with = "parse_isize")]
-    hid: isize,
-    pid: i64,
-    pid_tus: i64,
+struct RawPerson {
+    #[serde(rename = "OA11CD")]
+    oa: OA,
+    hid: String,
+    pid: String,
+
+    #[serde(rename = "id_TUS_hh")]
+    id_tus_hh: i64,
+    #[serde(rename = "id_TUS_p")]
+    id_tus_p: i64,
+    #[serde(rename = "id_HS")]
     pid_hse: i64,
     lat: f32,
     lng: f32,
 
-    sex: usize,
+    sex: i32,
     age: u32,
-    origin: usize,
-    nssec5: usize,
-    #[serde(deserialize_with = "parse_u64_or_na")]
-    sic1d07: u64,
-    #[serde(deserialize_with = "parse_u64_or_na")]
-    sic2d07: u64,
-    #[serde(deserialize_with = "parse_u64_or_na")]
-    soc2010: u64,
+    ethnicity: i32,
+    nssec8: i32,
+    sic1d2007: String,
+    sic2d2007: i64,
+    soc2010: i64,
+    pwkstat: i32,
+    #[serde(rename = "incomeH", deserialize_with = "parse_f32_or_na")]
+    salary_hourly: Option<f32>,
+    #[serde(rename = "incomeY", deserialize_with = "parse_f32_or_na")]
+    salary_yearly: Option<f32>,
 
-    #[serde(rename = "BMIvg6")]
-    bmi: String,
+    #[serde(rename = "HEALTH_bmi", deserialize_with = "parse_f32_or_na")]
+    bmi: Option<f32>,
+    #[serde(rename = "HEALTH_cvd")]
     cvd: u8,
+    #[serde(rename = "HEALTH_diabetes")]
     diabetes: u8,
+    #[serde(rename = "HEALTH_bloodpressure")]
     bloodpressure: u8,
+    #[serde(rename = "HEALTH_NMedicines")]
+    number_medications: i64,
+    #[serde(rename = "HEALTH_selfAssessed")]
+    self_assessed_health: i32,
+    #[serde(rename = "HEALTH_lifeSat")]
+    life_satisfaction: i32,
 
-    punknown: f64,
-    pwork: f64,
-    pschool: f64,
-    pshop: f64,
-    pservices: f64,
-    pleisure: f64,
-    pescort: f64,
-    ptransport: f64,
-    pnothome: f64,
-    phome: f64,
-    pworkhome: f64,
-    phometot: f64,
+    #[serde(rename = "HOUSE_nssec8")]
+    hh_nssec8: i32,
+    #[serde(rename = "HOUSE_type")]
+    accommodation_type: i32,
+    #[serde(rename = "HOUSE_typeCommunal")]
+    communal_type: i32,
+    #[serde(rename = "HOUSE_NRooms")]
+    num_rooms: i64,
+    #[serde(rename = "HOUSE_centralHeat")]
+    central_heat: i64,
+    #[serde(rename = "HOUSE_tenure")]
+    tenure: i32,
+    #[serde(rename = "HOUSE_NCars")]
+    num_cars: i64,
+
+    #[serde(rename = "ESport")]
+    e_sport: f32,
+    #[serde(rename = "ERugby")]
+    e_rugby: f32,
+    #[serde(rename = "EConcertM")]
+    e_concert_m: f32,
+    #[serde(rename = "EConcertF")]
+    e_concert_f: f32,
+    #[serde(rename = "EConcertMS")]
+    e_concert_ms: f32,
+    #[serde(rename = "EConcertFS")]
+    e_concert_fs: f32,
+    #[serde(rename = "EMuseum")]
+    e_museum: f32,
 }
 
-/// Parses either an unsigned integer or the string "NA". "NA" maps to 0, and this verifies that 0
-/// isn't an actual value that gets used.
-fn parse_u64_or_na<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+/// Parses either a float or the string "NA".
+fn parse_f32_or_na<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
     // We have to parse it as a string first, or we lose the chance to check that it's "NA" later
     let raw = <String>::deserialize(d)?;
-    if let Ok(x) = raw.parse::<u64>() {
-        if x == 0 {
-            return Err(serde::de::Error::custom(format!(
-                "The value 0 appears in the data, so we can't safely map NA to it"
-            )));
-        }
-        return Ok(x);
-    }
     if raw == "NA" {
-        return Ok(0);
+        return Ok(None);
+    }
+    if let Ok(x) = raw.parse::<f32>() {
+        return Ok(Some(x));
     }
     Err(serde::de::Error::custom(format!(
-        "Not a u64 or \"NA\": {}",
+        "Not a f32 or \"NA\": {}",
         raw
     )))
 }
 
-/// Parses a signed integer, handling scientific notation
-fn parse_isize<'de, D: Deserializer<'de>>(d: D) -> Result<isize, D::Error> {
-    // tus_hse_northamptonshire.csv expresses HID in scientific notation: 2.00563e+11
-    // Parse to f64, then cast
-    let float = <f64>::deserialize(d)?;
-    // TODO Is there a safety check we should do? Make sure it's already rounded?
-    Ok(float as isize)
+fn parse_optional_neg1(x: i64) -> Result<Option<u64>> {
+    if x == -1 {
+        Ok(None)
+    } else if x >= 0 {
+        Ok(Some(x as u64))
+    } else {
+        bail!("Unexpected negative input {x}");
+    }
 }
 
-impl TuPerson {
+impl RawPerson {
     fn create(self, household: VenueID, id: PersonID) -> Result<Person> {
-        let mut duration_per_activity: EnumMap<Activity, f64> = EnumMap::default();
-        duration_per_activity[Activity::Retail] = self.pshop;
-        duration_per_activity[Activity::Home] = self.phome;
-        duration_per_activity[Activity::Work] = self.pwork;
-
-        // Use pschool and age to calculate primary/secondary school
-        if self.age < 11 {
-            duration_per_activity[Activity::PrimarySchool] = self.pschool;
-            duration_per_activity[Activity::SecondarySchool] = 0.0;
-        } else if self.age < 19 {
-            duration_per_activity[Activity::PrimarySchool] = 0.0;
-            duration_per_activity[Activity::SecondarySchool] = self.pschool;
-        } else {
-            // TODO Seems like we need a University activity
-            duration_per_activity[Activity::PrimarySchool] = 0.0;
-            duration_per_activity[Activity::SecondarySchool] = 0.0;
-        }
-        pad_durations(&mut duration_per_activity)?;
-
         Ok(Person {
             id,
             household,
             workplace: None,
-            orig_pid_census: self.pid,
-            orig_pid_tus: self.pid_tus,
-            orig_pid_hse: self.pid_hse,
             location: Point::new(self.lng, self.lat),
 
+            identifiers: pb::Identifiers {
+                orig_pid: self.pid,
+                id_tus_hh: self.id_tus_hh,
+                id_tus_p: self.id_tus_p,
+                pid_hs: self.pid_hse,
+            },
             demographics: pb::Demographics {
-                sex: match self.sex {
-                    x if x == 0 => pb::Sex::Female,
-                    x if x == 1 => pb::Sex::Male,
-                    x => bail!("Unknown sex {}", x),
-                }
-                .into(),
+                sex: pb::Sex::from_i32(self.sex).expect("Unknown sex").into(),
                 age_years: self.age,
-                origin: match self.origin {
-                    x if x == 1 => pb::Origin::White,
-                    x if x == 2 => pb::Origin::Black,
-                    x if x == 3 => pb::Origin::Asian,
-                    x if x == 4 => pb::Origin::Mixed,
-                    x if x == 5 => pb::Origin::Other,
-                    x => bail!("Unknown origin {}", x),
-                }
-                .into(),
-                socioeconomic_classification: match self.nssec5 {
-                    x if x == 0 => pb::Nssec5::Unemployed,
-                    x if x == 1 => pb::Nssec5::Higher,
-                    x if x == 2 => pb::Nssec5::Intermediate,
-                    x if x == 3 => pb::Nssec5::Small,
-                    x if x == 4 => pb::Nssec5::Lower,
-                    x if x == 5 => pb::Nssec5::Routine,
-                    x => bail!("Unknown nssec5 {}", x),
-                }
-                .into(),
-                sic1d07: self.sic1d07,
-                sic2d07: self.sic2d07,
-                soc2010: self.soc2010,
+                ethnicity: pb::Ethnicity::from_i32(self.ethnicity)
+                    .expect("Unknown ethnicity")
+                    .into(),
+                nssec8: pb::Nssec8::from_i32(self.nssec8).map(|x| x.into()),
             },
-
-            bmi: match self.bmi.as_str() {
-                "Not applicable" => BMI::NotApplicable,
-                "Underweight: less than 18.5" => BMI::Underweight,
-                "Normal: 18.5 to less than 25" => BMI::Normal,
-                "Overweight: 25 to less than 30" => BMI::Overweight,
-                "Obese I: 30 to less than 35" => BMI::Obese1,
-                "Obese II: 35 to less than 40" => BMI::Obese2,
-                "Obese III: 40 or more" => BMI::Obese3,
-                x => bail!("Unknown BMIvg6 value {}", x),
+            employment: pb::Employment {
+                sic1d2007: if self.sic1d2007 == "-1" {
+                    None
+                } else if self.sic1d2007.len() != 1 {
+                    bail!("Unknown sic1d2007 value {}", self.sic1d2007);
+                } else {
+                    Some(self.sic1d2007)
+                },
+                sic2d2007: parse_optional_neg1(self.sic2d2007)?,
+                soc2010: parse_optional_neg1(self.soc2010)?,
+                pwkstat: pb::PwkStat::from_i32(self.pwkstat)
+                    .expect("Unknown pwkstat")
+                    .into(),
+                salary_hourly: self.salary_hourly,
+                salary_yearly: self.salary_yearly,
             },
-            has_cardiovascular_disease: self.cvd > 0,
-            has_diabetes: self.diabetes > 0,
-            has_high_blood_pressure: self.bloodpressure > 0,
-
-            time_use: pb::TimeUse {
-                unknown: self.punknown,
-                work: self.pwork,
-                school: self.pschool,
-                shop: self.pshop,
-                services: self.pservices,
-                leisure: self.pleisure,
-                escort: self.pescort,
-                transport: self.ptransport,
-                not_home: self.pnothome,
-                home: self.phome,
-                work_home: self.pworkhome,
-                home_total: self.phometot,
+            health: pb::Health {
+                bmi: self.bmi,
+                has_cardiovascular_disease: self.cvd > 0,
+                has_diabetes: self.diabetes > 0,
+                has_high_blood_pressure: self.bloodpressure > 0,
+                number_medications: parse_optional_neg1(self.number_medications)?,
+                self_assessed_health: pb::SelfAssessedHealth::from_i32(self.self_assessed_health)
+                    .map(|x| x.into()),
+                life_satisfaction: pb::LifeSatisfaction::from_i32(self.life_satisfaction)
+                    .map(|x| x.into()),
             },
-
-            duration_per_activity,
+            events: pb::Events {
+                sport: self.e_sport,
+                rugby: self.e_rugby,
+                concert_m: self.e_concert_m,
+                concert_f: self.e_concert_f,
+                concert_ms: self.e_concert_ms,
+                concert_fs: self.e_concert_fs,
+                museum: self.e_museum,
+            },
+            weekday_diaries: Vec::new(),
+            weekend_diaries: Vec::new(),
         })
     }
-}
-
-// If the durations don't sum to 1, pad Home
-fn pad_durations(durations: &mut EnumMap<Activity, f64>) -> Result<()> {
-    let total: f64 = durations.values().sum();
-    // TODO Check the rounding in the Python version
-    let epsilon = 0.00001;
-    if total > 1.0 + epsilon {
-        bail!("Someone's durations sum to {}", total);
-    } else if total < 1.0 {
-        durations[Activity::Home] = 1.0 - total;
-    }
-    Ok(())
 }
 
 #[instrument(skip(threshold, population))]

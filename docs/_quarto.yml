@@ -1,34 +1,38 @@
 project:
-  type: website
+  type: book
 
-website:
+book:
   title: "Synthetic Population Catalyst"
-  sidebar:
-    style: "docked"
-    search: true
-    contents:
-      - index.qmd
-      - section: "Using it"
-        contents:
-          - getting_started.qmd
-          - installation.qmd
-          - using_spc.qmd
-          - transform_it.qmd
-          - created_areas.qmd
-          - outputs.qmd
-          - troubleshooting.qmd
-      - section: "Understanding it"
-        contents:
-          - understanding.qmd
-          - modelling_methods.qmd
-          - data_sources.qmd
-      - section: "Internals"
-        contents:
-          - developer_guide.qmd
-          - code_walkthrough.qmd
-          - performance.qmd
+  search: true
+  repo-url: https://github.com/alan-turing-institute/uatk-spc/tree/main/docs
+  downloads: [pdf]
+  chapters:
+    - index.qmd
+    - part: "Using SPC"
+      chapters:
+        - using_getting_started.qmd
+        - using_outputs.qmd
+        - using_england_outputs.qmd
+        - using_wales_outputs.qmd
+        - using_scotland_outputs.qmd
+        - using_use_output.qmd
+        - using_installation.qmd
+        - using_custom_areas.qmd
+    - part: "Understanding SPC"
+      chapters:
+        - understanding_introduction.qmd
+        - understanding_technical_overview.qmd
+        - understanding_modelling_methods.qmd
+        - understanding_data_schema.qmd
+        - understanding_data_sources.qmd
+    - validation.qmd
+    - part: "Advanced"
+      chapters:
+        - advanced_developer_guide.qmd
+        - advanced_code_walkthrough.qmd
+        - advanced_performance.qmd
 
 format:
   html:
     theme: cosmo
-    css: styles.css
+  pdf: default

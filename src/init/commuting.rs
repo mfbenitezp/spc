@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use fs_err::File;
@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use typed_index_collections::TiVec;
 
+use crate::pb::PwkStat;
 use crate::utilities::{print_count, progress_count};
 use crate::{Activity, PersonID, Population, Venue, VenueID, MSOA};
 
@@ -28,7 +29,10 @@ pub fn create_commuting_flows(
     // away, where the only activity occuring is work.
     let mut msoas = BTreeSet::new();
     for person in &population.people {
-        if person.duration_per_activity[Activity::Work] > 0.0 {
+        if matches!(
+            PwkStat::from_i32(person.employment.pwkstat).unwrap(),
+            PwkStat::EmployeeFt | PwkStat::EmployeePt | PwkStat::EmployeeUnspec
+        ) {
             all_workers.push(person.id);
             msoas.insert(population.households[person.household].msoa.clone());
         }
@@ -67,20 +71,21 @@ struct Row {
     lat: f32,
     // The number of workers
     size: usize,
-    sic1d07: u64,
+    #[serde(rename = "sic1d07")]
+    sic1d2007: u32,
 }
 
 struct Businesses {
-    venues_per_sic: HashMap<u64, Vec<VenueID>>,
-    available_jobs: HashMap<VenueID, usize>,
+    venues_per_sic: BTreeMap<u32, Vec<VenueID>>,
+    available_jobs: BTreeMap<VenueID, usize>,
     venues: TiVec<VenueID, Venue>,
 }
 
 impl Businesses {
     fn load(msoas: BTreeSet<MSOA>) -> Result<Businesses> {
         let mut result = Businesses {
-            venues_per_sic: HashMap::new(),
-            available_jobs: HashMap::new(),
+            venues_per_sic: BTreeMap::new(),
+            available_jobs: BTreeMap::new(),
             venues: TiVec::new(),
         };
 
@@ -88,7 +93,7 @@ impl Businesses {
         info!("Finding all businesses");
         let mut total_jobs = 0;
         for rec in csv::Reader::from_reader(File::open(
-            "data/raw_data/nationaldata/businessRegistry.csv",
+            "data/raw_data/nationaldata-v2/businessRegistry.csv",
         )?)
         .deserialize()
         {
@@ -97,12 +102,9 @@ impl Businesses {
                 // The CSV has string IDs, but they're not used anywhere else. Immediately create a
                 // venue and use integer IDs, which're much faster to copy around.
                 let id = VenueID(result.venues.len());
-                if rec.sic1d07 == 0 {
-                    bail!("A business unexpectedly uses SIC 0: {:?}", rec);
-                }
                 result
                     .venues_per_sic
-                    .entry(rec.sic1d07)
+                    .entry(rec.sic1d2007)
                     .or_insert_with(Vec::new)
                     .push(id);
                 result.venues.push(Venue {
@@ -125,7 +127,7 @@ impl Businesses {
 }
 
 struct JobMarket {
-    sic: Option<u64>,
+    sic: Option<u32>,
     // workers and jobs have equal length
     workers: Vec<PersonID>,
     jobs: Vec<VenueID>,
@@ -157,7 +159,9 @@ impl JobMarket {
             // Find workers with a matching SIC
             let mut workers: Vec<PersonID> = Vec::new();
             for id in &all_workers {
-                if population.people[*id].demographics.sic1d07 == *sic {
+                if numeric_sic1d2007(population.people[*id].employment.sic1d2007.as_ref())
+                    == Some(*sic)
+                {
                     workers.push(*id);
                 }
             }
@@ -221,6 +225,7 @@ impl JobMarket {
         assert_eq!(self.jobs.len(), self.workers.len());
 
         let mut choices: Vec<(VenueID, usize)> = self.to_job_choices();
+        let mut empty_jobs = 0;
 
         let mut output = Vec::new();
         for person in self.workers {
@@ -233,10 +238,21 @@ impl JobMarket {
                 })
                 .unwrap();
 
+            output.push((person, pair.0));
+
             // This job is gone
             pair.1 -= 1;
-
-            output.push((person, pair.0));
+            // Periodically clean up the list of choices. Doing this constantly would be slow
+            // (Vec::retain isn't free), but never doing it means choose_weighted_mut repeatedly
+            // skips past a bunch of useless choices
+            if pair.1 == 0 {
+                empty_jobs += 1;
+                // This exact value is not so carefully tuned. 10 and 500 provided similar timings.
+                if empty_jobs == 100 {
+                    empty_jobs = 0;
+                    choices.retain(|pair| pair.1 > 0);
+                }
+            }
         }
         output
     }
@@ -252,5 +268,23 @@ fn trim_jobs_or_workers(jobs: &mut Vec<VenueID>, workers: &mut Vec<PersonID>, rn
     if jobs.len() > workers.len() {
         jobs.shuffle(rng);
         jobs.truncate(workers.len());
+    }
+}
+
+/// Turn "A" into 1, "B" into 2, etc
+fn numeric_sic1d2007(input: Option<&String>) -> Option<u32> {
+    let x = input?.chars().next().unwrap();
+    Some(1 + x as u32 - 'A' as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sic1d2007() {
+        assert_eq!(numeric_sic1d2007(None), None);
+        assert_eq!(numeric_sic1d2007(Some(&"A".to_string())), Some(1));
+        assert_eq!(numeric_sic1d2007(Some(&"F".to_string())), Some(6));
     }
 }

@@ -5,105 +5,111 @@ use anyhow::Result;
 use fs_err::File;
 use serde::Deserialize;
 
-use crate::utilities::{basename, download, filename, print_count, untar, unzip};
-use crate::{County, Input, MSOA};
+use crate::utilities::{basename, download, filename, gunzip, print_count, untar, unzip};
+use crate::{County, Input, MSOA, OA};
 
 pub struct RawDataResults {
-    pub tus_files: Vec<String>,
+    pub population_files: Vec<String>,
     pub osm_directories: Vec<String>,
     pub msoas_per_county: BTreeMap<County, Vec<MSOA>>,
+    pub oa_to_msoa: BTreeMap<OA, MSOA>,
 }
 
 #[instrument(skip_all)]
 pub async fn grab_raw_data(input: &Input) -> Result<RawDataResults> {
     let mut results = RawDataResults {
-        tus_files: Vec::new(),
+        population_files: Vec::new(),
         osm_directories: Vec::new(),
         msoas_per_county: BTreeMap::new(),
+        oa_to_msoa: BTreeMap::new(),
     };
 
     // This maps MSOA IDs to things like OSM geofabrik URL
-    // TODO Who creates/maintains this?
-    let lookup_path = download_file("referencedata", "lookUp.csv").await?;
+    let lookup_path = gunzip(download_file("referencedata", "lookUp-GB.csv.gz").await?)?;
 
-    // TODO Who creates these TUS?
-    // tu = time use
-    let mut tus_needed = BTreeSet::new();
+    let mut pop_files_needed = BTreeSet::new();
     let mut osm_needed = BTreeSet::new();
     for rec in csv::Reader::from_reader(File::open(lookup_path)?).deserialize() {
-        let rec: MsoaLookupRow = rec?;
+        let rec: LookupRow = rec?;
+        results.oa_to_msoa.insert(rec.oa, rec.msoa.clone());
         if input.msoas.contains(&rec.msoa) {
-            tus_needed.insert(rec.new_tu);
+            pop_files_needed.insert((rec.country, rec.azure_ref));
             osm_needed.insert(rec.osm);
             results
                 .msoas_per_county
                 .entry(rec.county)
                 .or_insert_with(Vec::new)
-                .push(rec.msoa);
+                .push(rec.msoa.clone());
         }
     }
     info!(
         "From {} MSOAs, we need {} time use files and {} OSM files",
         print_count(input.msoas.len()),
-        print_count(tus_needed.len()),
+        print_count(pop_files_needed.len()),
         print_count(osm_needed.len())
     );
 
-    for tu in tus_needed {
-        let gzip_path = download_file("countydata", format!("tus_hse_{}.gz", tu)).await?;
-        let output_path = format!("data/raw_data/countydata/tus_hse_{}.csv", tu);
-        untar(gzip_path, &output_path)?;
-        results.tus_files.push(output_path);
+    for (country, area) in pop_files_needed {
+        results.population_files.push(gunzip(
+            download_file(
+                &format!("countydata-v2-1/{country}/{}", input.year),
+                format!("pop_{area}_{}.csv.gz", input.year,),
+            )
+            .await?,
+        )?);
     }
 
     for osm_url in osm_needed {
         let zip_path = download(
             &osm_url,
-            format!("data/raw_data/countydata/OSM/{}", filename(&osm_url)),
+            format!("data/raw_data/countydata-v2-1/OSM/{}", filename(&osm_url)),
         )
         .await?;
         // TODO .shp.zip, so we have to do basename twice
         let output_dir = format!(
-            "data/raw_data/countydata/OSM/{}/",
-            basename(&basename(&osm_url))
+            "data/raw_data/countydata-v2-1/OSM/{}/",
+            basename(basename(&osm_url))
         );
         unzip(zip_path, &output_dir)?;
         results.osm_directories.push(output_dir);
     }
 
-    let path = download_file("nationaldata", "QUANT_RAMP_spc.tar.gz").await?;
-    untar(path, "data/raw_data/nationaldata/QUANT_RAMP/")?;
+    let path = download_file("nationaldata-v2", "QUANT_RAMP_spc.tar.gz").await?;
+    untar(path, "data/raw_data/nationaldata-v2/QUANT_RAMP/")?;
 
-    // CommutingOD is all commented out
+    gunzip(download_file("nationaldata-v2", "businessRegistry.csv.gz").await?)?;
 
-    download_file("nationaldata", "businessRegistry.csv").await?;
+    gunzip(download_file("nationaldata-v2", "timeAtHomeIncreaseCTY.csv.gz").await?)?;
 
-    download_file("nationaldata", "timeAtHomeIncreaseCTY.csv").await?;
+    download_file("nationaldata-v2", "GIS/MSOA_2011_Pop20.geojson").await?;
 
-    let path = download_file("nationaldata", "MSOAS_shp.tar.gz").await?;
-    untar(path, "data/raw_data/nationaldata/MSOAS_shp/")?;
+    gunzip(download_file("nationaldata-v2", "diariesRef.csv.gz").await?)?;
 
     Ok(results)
 }
 
 #[derive(Deserialize)]
-struct MsoaLookupRow {
+struct LookupRow {
     #[serde(rename = "MSOA11CD")]
     msoa: MSOA,
-    #[serde(rename = "NewTU")]
-    new_tu: String,
+    #[serde(rename = "OA11CD")]
+    oa: OA,
+    #[serde(rename = "AzureRef")]
+    azure_ref: String,
     #[serde(rename = "OSM")]
     osm: String,
     #[serde(rename = "GoogleMob")]
     county: County,
+    #[serde(rename = "Country")]
+    country: String,
 }
 
 /// Calculates all MSOAs nationally from the lookup table
 pub async fn all_msoas_nationally() -> Result<BTreeSet<MSOA>> {
-    let lookup_path = download_file("referencedata", "lookUp.csv").await?;
+    let lookup_path = gunzip(download_file("referencedata", "lookUp-GB.csv.gz").await?)?;
     let mut msoas = BTreeSet::new();
     for rec in csv::Reader::from_reader(File::open(lookup_path)?).deserialize() {
-        let rec: MsoaLookupRow = rec?;
+        let rec: LookupRow = rec?;
         msoas.insert(rec.msoa);
     }
     Ok(msoas)
@@ -111,8 +117,6 @@ pub async fn all_msoas_nationally() -> Result<BTreeSet<MSOA>> {
 
 async fn download_file<P: AsRef<str>>(dir: &str, file: P) -> Result<PathBuf> {
     let azure = Path::new("https://ramp0storage.blob.core.windows.net/");
-    // TODO Azure uses nationaldata, countydata, etc. Local output in Python inserts an underscore.
-    // Meh?
     let file = file.as_ref();
     download(
         azure.join(dir).join(file),
